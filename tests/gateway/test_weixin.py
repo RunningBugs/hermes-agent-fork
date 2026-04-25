@@ -12,7 +12,7 @@ from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_over
 from gateway.platforms.base import SendResult
 from gateway.platforms import weixin
 from gateway.platforms.weixin import ContextTokenStore, WeixinAdapter
-from tools.send_message_tool import _parse_target_ref, _send_to_platform
+from tools.send_message_tool import _parse_target_ref, _send_to_platform, send_message_tool
 
 
 def _make_adapter() -> WeixinAdapter:
@@ -308,6 +308,72 @@ class TestWeixinSendMessageIntegration:
             media_files=[("/tmp/demo.png", False)],
         )
 
+    @patch("tools.send_message_tool._send_weixin", new_callable=AsyncMock)
+    def test_send_message_preserves_weixin_home_channel(self, send_weixin_mock):
+        send_weixin_mock.return_value = {"success": True, "platform": "weixin", "chat_id": "wxid_home@im.wechat"}
+
+        class DummyConfig:
+            def __init__(self):
+                self.platforms = {
+                    Platform.WEIXIN: PlatformConfig(enabled=True, token="bot-token", extra={"account_id": "bot-account"})
+                }
+
+            def get_home_channel(self, platform):
+                assert platform == Platform.WEIXIN
+                return HomeChannel(platform=Platform.WEIXIN, chat_id="wxid_home@im.wechat", name="Home")
+
+        with patch("gateway.config.load_gateway_config", return_value=DummyConfig()):
+            result = json.loads(send_message_tool({"target": "weixin", "message": "hello"}))
+
+        assert result["success"] is True
+        send_weixin_mock.assert_awaited_once()
+        call_args = send_weixin_mock.await_args.args
+        assert call_args[1] == "wxid_home@im.wechat"
+
+    def test_send_weixin_direct_avoids_reusing_live_adapter_from_other_loop(self):
+        class DummyLiveAdapter:
+            def __init__(self):
+                self._event_loop = object()
+                self._send_session = object()
+
+            def format_message(self, message):
+                raise AssertionError("live adapter should not be used across loops")
+
+            async def send(self, *args, **kwargs):
+                raise AssertionError("live adapter send should not be called")
+
+        class DummySessionCM:
+            def __init__(self, session):
+                self._session = session
+
+            async def __aenter__(self):
+                return self._session
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        dummy_session = object()
+        live_adapter = DummyLiveAdapter()
+
+        async def fake_send(self, chat_id, content, reply_to=None, metadata=None):
+            assert chat_id == "wxid_test123"
+            assert content == "hello"
+            return SendResult(success=True, message_id="msg-new")
+
+        with patch.dict(weixin._LIVE_ADAPTERS, {"bot-token": live_adapter}, clear=True), \
+             patch.object(weixin.WeixinAdapter, "send", new=fake_send), \
+             patch("gateway.platforms.weixin.aiohttp.ClientSession", return_value=DummySessionCM(dummy_session)):
+            result = asyncio.run(
+                weixin.send_weixin_direct(
+                    extra={"account_id": "bot-account", "base_url": "https://example.com", "cdn_base_url": "https://cdn.example.com"},
+                    token="bot-token",
+                    chat_id="wxid_test123",
+                    message="hello",
+                )
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "msg-new"
 
 class TestWeixinChunkDelivery:
     def _connected_adapter(self) -> WeixinAdapter:

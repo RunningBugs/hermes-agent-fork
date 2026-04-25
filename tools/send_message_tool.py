@@ -50,8 +50,6 @@ def _sanitize_error_text(text) -> str:
     redacted = _URL_SECRET_QUERY_RE.sub(lambda m: f"{m.group(1)}***", redacted)
     redacted = _GENERIC_SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=***", redacted)
     return redacted
-
-
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
@@ -258,7 +256,7 @@ def _handle_send(args):
                 from gateway.config import HomeChannel
                 home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
         if home:
-            chat_id = home.chat_id
+            chat_id = home.chat_id if platform_name == "weixin" else home.chat_id
             used_home_channel = True
         else:
             return json.dumps({
@@ -321,7 +319,7 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "weixin":
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
-            return match.group(1), None, True
+            return match.group(1).strip(), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
