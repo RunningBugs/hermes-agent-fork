@@ -238,6 +238,26 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+_hermes_config_resolved: str | None = None
+_hermes_config_resolved_loaded = False
+
+
+def _get_hermes_config_resolved() -> str | None:
+    """Return the resolved absolute path of the Hermes config file (cached)."""
+    global _hermes_config_resolved, _hermes_config_resolved_loaded
+    if _hermes_config_resolved_loaded:
+        return _hermes_config_resolved
+    _hermes_config_resolved_loaded = True
+    try:
+        from hermes_cli.config import get_config_path
+        _hermes_config_resolved = str(get_config_path().resolve())
+    except Exception:
+        try:
+            _hermes_config_resolved = str(Path("~/.hermes/config.yaml").expanduser().resolve())
+        except Exception:
+            _hermes_config_resolved = None
+    return _hermes_config_resolved
+
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
@@ -255,24 +275,47 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
+    # Prevent agents from modifying the Hermes config file directly.
+    # approvals.mode and other security settings live here; a malicious or
+    # prompt-injected agent could silently disable exec approval by writing to
+    # this file.
+    hermes_config = _get_hermes_config_resolved()
+    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+        return (
+            f"Refusing to write to Hermes config file: {filepath}\n"
+            "Agent cannot modify security-sensitive configuration. "
+            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
     return None
 
 
 def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return a cross-profile warning string when ``filepath`` lands in
-    another Hermes profile's skills/plugins/cron/memories directory.
+    """Return a soft-guard warning when ``filepath`` lands in another Hermes
+    profile's scoped area or a sandbox-mirror of authoritative profile state.
 
-    Returns ``None`` when the write is in-scope (same profile) or outside
-    Hermes scope entirely. Soft guard — the agent can override by passing
-    ``cross_profile=True`` to its write tool after explicit user direction.
+    Two detectors run in order:
 
-    Defense-in-depth, NOT a security boundary — the terminal tool runs
-    as the same OS user and can write any of these paths directly.
-    See ``agent/file_safety.classify_cross_profile_target`` for the
-    detection rules.
+    * cross-profile (#TBD) — writes that hit another profile's
+      ``skills/plugins/cron/memories`` directory.
+    * sandbox-mirror (#32049) — writes that hit the
+      ``…/sandboxes/<backend>/<task>/home/.hermes/…`` mirror created by a
+      non-local terminal backend (Docker, Daytona, etc.), where the host
+      Hermes process never reads the mirror and the authoritative file is
+      left untouched.
+
+    Returns ``None`` when the write is in-scope or outside Hermes scope.
+    Both detectors are soft guards — the agent can override either by
+    passing ``cross_profile=True`` to its write tool after explicit user
+    direction. Defense-in-depth, NOT a security boundary — the terminal
+    tool runs as the same OS user and can write any of these paths
+    directly. See ``agent/file_safety.classify_cross_profile_target`` and
+    ``classify_sandbox_mirror_target`` for the detection rules.
     """
     try:
-        from agent.file_safety import get_cross_profile_warning
+        from agent.file_safety import (
+            get_cross_profile_warning,
+            get_sandbox_mirror_warning,
+        )
     except Exception:
         # Fail open on import error — the existing sensitive-path guard
         # plus the write_denied list still apply.
@@ -286,7 +329,10 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     except (OSError, ValueError):
         resolved = filepath
 
-    return get_cross_profile_warning(resolved)
+    warning = get_cross_profile_warning(resolved)
+    if warning is not None:
+        return warning
+    return get_sandbox_mirror_warning(resolved)
 
 
 def _is_expected_write_exception(exc: Exception) -> bool:
