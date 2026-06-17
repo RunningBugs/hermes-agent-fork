@@ -40,6 +40,7 @@ from agent.prompt_builder import (
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
 
@@ -191,21 +192,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
             if toolset
         }
-        # Coding posture prunes non-coding skill categories from the index
-        # (discovery-only — skills_list/skill_view still reach everything).
-        _hidden_cats = frozenset()
+        # Focus mode (opt-in) demotes non-coding skill categories to
+        # names-only in the index (never hidden — skill_view/skills_list
+        # reach everything, and every name stays visible for recall). The
+        # default coding posture leaves the index untouched.
+        _compact_cats = frozenset()
         try:
-            from agent.coding_context import coding_hidden_skill_categories
+            from agent.coding_context import coding_compact_skill_categories
 
-            _hidden_cats = coding_hidden_skill_categories(
+            _compact_cats = coding_compact_skill_categories(
                 platform=agent.platform, cwd=resolve_context_cwd()
             )
         except Exception:
-            _hidden_cats = frozenset()
+            _compact_cats = frozenset()
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
-            hidden_categories=_hidden_cats or None,
+            compact_categories=_compact_cats or None,
         )
     else:
         skills_prompt = ""
@@ -398,7 +401,14 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     warm across turns.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
-    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+
+    # Surface context-file truncation warnings through the normal agent status
+    # channel so gateway/CLI users see them in chat instead of only in logs.
+    for warning in drain_truncation_warnings():
+        agent._emit_status(warning)
+
+    return joined
 
 
 def invalidate_system_prompt(agent: Any) -> None:
